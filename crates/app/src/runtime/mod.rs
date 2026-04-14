@@ -6,11 +6,12 @@ use pdcore::CoreError;
 use pdcore::traits::Profiler;
 use pdcore::types::ControlCommand;
 use profiler_cpu_clock::CpuClockProfiler;
+use profiler_cpu_usage::CpuUsageProfiler;
 use profiler_fps::FpsProfiler;
 use registry::ProfilerRegistry;
 
 use crate::aggregation::{AggregationWorker, AggregatorEvent};
-use crate::device::{DeviceDescriptor, query_device_descriptor};
+use crate::device::{connect_wireless, list_adb_devices, query_device_descriptor, DeviceDescriptor};
 use crate::session::SessionState;
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct PerfDroidRuntime {
 struct RuntimeInner {
     state: SessionState,
     cpu_clock_profiler: Option<Arc<Mutex<CpuClockProfiler>>>,
+    cpu_usage_profiler: Option<Arc<Mutex<CpuUsageProfiler>>>,
     fps_profiler: Option<Arc<Mutex<FpsProfiler>>>,
     worker: Option<AggregationWorker>,
     registry: ProfilerRegistry,
@@ -36,6 +38,7 @@ impl PerfDroidRuntime {
             inner: Arc::new(Mutex::new(RuntimeInner {
                 state: SessionState::Disconnected,
                 cpu_clock_profiler: None,
+                cpu_usage_profiler: None,
                 fps_profiler: None,
                 worker: None,
                 registry: ProfilerRegistry::default(),
@@ -47,10 +50,60 @@ impl PerfDroidRuntime {
         }
     }
 
+    pub fn request_refresh_devices(&self) {
+        match list_adb_devices() {
+            Ok(devices) => {
+                let count = devices.len();
+                let _ = self
+                    .event_tx
+                    .send(AggregatorEvent::DeviceDiscoveryUpdated(devices));
+                let _ = self.event_tx.send(AggregatorEvent::Status(format!(
+                    "ADB detection complete: {count} device(s) found."
+                )));
+            }
+            Err(err) => {
+                let _ = self.event_tx.send(AggregatorEvent::Status(err));
+            }
+        }
+    }
+
+    pub fn request_connect_usb(&self, serial: String) {
+        if let Err(err) = self.connect(serial.clone()) {
+            let _ = self.event_tx.send(AggregatorEvent::Status(err.to_string()));
+        } else {
+            let _ = self.event_tx.send(AggregatorEvent::Status(format!(
+                "Connected to `{serial}` through USB."
+            )));
+        }
+    }
+
+    pub fn request_connect_wireless(&self, serial: String) {
+        match connect_wireless(&serial) {
+            Ok((wireless_serial, detail)) => {
+                if let Err(err) = self.connect(wireless_serial.clone()) {
+                    let _ = self.event_tx.send(AggregatorEvent::Status(format!(
+                        "{detail} Failed to finish wireless session setup for `{wireless_serial}`: {err}"
+                    )));
+                } else {
+                    let _ = self.event_tx.send(AggregatorEvent::Status(format!(
+                        "{detail} Connected through WiFi as `{wireless_serial}`."
+                    )));
+                }
+            }
+            Err(err) => {
+                let _ = self.event_tx.send(AggregatorEvent::Status(err));
+            }
+        }
+    }
+
     pub fn request_connect(&self, serial: Option<String>) {
-        if let Err(err) = self.connect(serial) {
+        if let Err(err) = self.connect(serial.unwrap_or_else(|| "default".to_string())) {
             let _ = self.event_tx.send(AggregatorEvent::Status(err.to_string()));
         }
+    }
+
+    pub fn request_status(&self, message: impl Into<String>) {
+        let _ = self.event_tx.send(AggregatorEvent::Status(message.into()));
     }
 
     pub fn request_start(&self, hz: u64) {
@@ -134,26 +187,38 @@ impl PerfDroidRuntime {
             .unwrap_or(SessionState::Disconnected)
     }
 
-    fn connect(&self, serial: Option<String>) -> Result<(), CoreError> {
+    fn connect(&self, serial: String) -> Result<(), CoreError> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| CoreError::Runtime("runtime lock poisoned".to_string()))?;
         ensure_transition(inner.state, ControlCommand::Connect)?;
 
-        let device = query_device_descriptor(serial.as_deref()).map_err(CoreError::Runtime)?;
+        let serial_arg = if serial == "default" {
+            None
+        } else {
+            Some(serial.as_str())
+        };
+        let device = query_device_descriptor(serial_arg).map_err(CoreError::Runtime)?;
         inner.registry.clear();
         inner.device = Some(device.clone());
 
         let mut cpu_clock_profiler =
-            CpuClockProfiler::new(serial.clone(), Duration::from_millis(100))?;
+            CpuClockProfiler::new(serial_arg.map(str::to_string), Duration::from_millis(100))?;
         cpu_clock_profiler.connect()?;
         let cpu_clock_metadata = cpu_clock_profiler.metadata_clone();
         inner.registry.register(cpu_clock_metadata.clone());
         inner.cpu_clock_profiler = Some(Arc::new(Mutex::new(cpu_clock_profiler)));
 
+        let mut cpu_usage_profiler =
+            CpuUsageProfiler::new(serial_arg.map(str::to_string), Duration::from_millis(100))?;
+        cpu_usage_profiler.connect()?;
+        let cpu_usage_metadata = cpu_usage_profiler.metadata_clone();
+        inner.registry.register(cpu_usage_metadata.clone());
+        inner.cpu_usage_profiler = Some(Arc::new(Mutex::new(cpu_usage_profiler)));
+
         let fps_profiler = match FpsProfiler::new(
-            serial.clone(),
+            serial_arg.map(str::to_string),
             Duration::from_secs(1),
             inner.package_name.clone(),
         ) {
@@ -195,6 +260,18 @@ impl PerfDroidRuntime {
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
+        let _ = self
+            .event_tx
+            .send(AggregatorEvent::MetadataRegistered(format!(
+                "{} [{}]",
+                cpu_usage_metadata.profiler_key,
+                cpu_usage_metadata
+                    .ordered_collectors()
+                    .iter()
+                    .map(|collector| collector.collector_key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         if let Some((_, metadata)) = fps_profiler {
             let _ = self
                 .event_tx
@@ -230,12 +307,19 @@ impl PerfDroidRuntime {
         inner.selected_hz = hz.clamp(1, 10);
 
         let cpu_clock_profiler = inner.cpu_clock_profiler.clone();
+        let cpu_usage_profiler = inner.cpu_usage_profiler.clone();
         let fps_profiler = inner.fps_profiler.clone();
 
         if let Some(profiler) = cpu_clock_profiler.as_ref() {
             profiler
                 .lock()
                 .map_err(|_| CoreError::Runtime("CPU_CLOCK profiler lock poisoned".to_string()))?
+                .start()?;
+        }
+        if let Some(profiler) = cpu_usage_profiler.as_ref() {
+            profiler
+                .lock()
+                .map_err(|_| CoreError::Runtime("CPU_USAGE profiler lock poisoned".to_string()))?
                 .start()?;
         }
         if let Some(profiler) = fps_profiler.as_ref() {
@@ -248,6 +332,7 @@ impl PerfDroidRuntime {
         inner.worker = Some(
             AggregationWorker::spawn(
                 cpu_clock_profiler,
+                cpu_usage_profiler,
                 fps_profiler,
                 inner.selected_hz,
                 self.event_tx.clone(),
@@ -277,6 +362,12 @@ impl PerfDroidRuntime {
                 .map_err(|_| CoreError::Runtime("CPU_CLOCK profiler lock poisoned".to_string()))?
                 .pause()?;
         }
+        if let Some(profiler) = inner.cpu_usage_profiler.as_ref() {
+            profiler
+                .lock()
+                .map_err(|_| CoreError::Runtime("CPU_USAGE profiler lock poisoned".to_string()))?
+                .pause()?;
+        }
         if let Some(profiler) = inner.fps_profiler.as_ref() {
             profiler
                 .lock()
@@ -304,6 +395,12 @@ impl PerfDroidRuntime {
             profiler
                 .lock()
                 .map_err(|_| CoreError::Runtime("CPU_CLOCK profiler lock poisoned".to_string()))?
+                .restart()?;
+        }
+        if let Some(profiler) = inner.cpu_usage_profiler.as_ref() {
+            profiler
+                .lock()
+                .map_err(|_| CoreError::Runtime("CPU_USAGE profiler lock poisoned".to_string()))?
                 .restart()?;
         }
         if let Some(profiler) = inner.fps_profiler.as_ref() {
@@ -340,6 +437,12 @@ impl PerfDroidRuntime {
                 .map_err(|_| CoreError::Runtime("CPU_CLOCK profiler lock poisoned".to_string()))?
                 .stop()?;
         }
+        if let Some(profiler) = inner.cpu_usage_profiler.as_ref() {
+            profiler
+                .lock()
+                .map_err(|_| CoreError::Runtime("CPU_USAGE profiler lock poisoned".to_string()))?
+                .stop()?;
+        }
         if let Some(profiler) = inner.fps_profiler.as_ref() {
             profiler
                 .lock()
@@ -347,6 +450,7 @@ impl PerfDroidRuntime {
                 .stop()?;
         }
         inner.cpu_clock_profiler = None;
+        inner.cpu_usage_profiler = None;
         inner.fps_profiler = None;
         inner.state = SessionState::Stopped;
         let _ = self

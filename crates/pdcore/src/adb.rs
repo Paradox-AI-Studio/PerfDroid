@@ -1,6 +1,8 @@
 use adb_client::server::ADBServer;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt};
 
 const ADB_SERVER_PORT: u16 = 5037;
 
@@ -30,7 +32,14 @@ pub fn workspace_adb_dir() -> PathBuf {
 
 /// Returns the host-specific bundled `adb` executable path.
 pub fn workspace_adb_path() -> PathBuf {
-    workspace_root().join(bundled_adb_relative_path())
+    let adb_path = workspace_root().join(bundled_adb_relative_path());
+    if let Err(err) = ensure_bundled_adb_permissions(&adb_path) {
+        eprintln!(
+            "warning: failed to ensure executable permissions for `{}`: {err}",
+            adb_path.display()
+        );
+    }
+    adb_path
 }
 
 /// Creates an [`ADBServer`] configured to start from the bundled workspace-local `adb`.
@@ -78,6 +87,7 @@ fn candidate_roots() -> Vec<PathBuf> {
         && let Some(exe_dir) = exe_path.parent()
     {
         push_ancestors(exe_dir, &mut roots);
+        push_macos_bundle_resource_root(exe_dir, &mut roots);
     }
 
     if let Ok(current_dir) = std::env::current_dir() {
@@ -87,6 +97,29 @@ fn candidate_roots() -> Vec<PathBuf> {
     roots.push(source_workspace_root());
     roots
 }
+
+#[cfg(target_os = "macos")]
+fn push_macos_bundle_resource_root(exe_dir: &Path, roots: &mut Vec<PathBuf>) {
+    let Some(contents_dir) = exe_dir.parent() else {
+        return;
+    };
+
+    if contents_dir.file_name() != Some(std::ffi::OsStr::new("Contents")) {
+        return;
+    }
+
+    if exe_dir.file_name() != Some(std::ffi::OsStr::new("MacOS")) {
+        return;
+    }
+
+    let resources_dir = contents_dir.join("Resources");
+    if !roots.contains(&resources_dir) {
+        roots.push(resources_dir);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn push_macos_bundle_resource_root(_exe_dir: &Path, _roots: &mut Vec<PathBuf>) {}
 
 fn push_ancestors(path: &Path, roots: &mut Vec<PathBuf>) {
     for ancestor in path.ancestors() {
@@ -105,6 +138,24 @@ fn source_workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[cfg(unix)]
+fn ensure_bundled_adb_permissions(adb_path: &Path) -> std::io::Result<()> {
+    let metadata = fs::metadata(adb_path)?;
+    let mode = metadata.permissions().mode();
+    let executable_mode = mode | 0o111;
+    if mode != executable_mode {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(executable_mode);
+        fs::set_permissions(adb_path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_bundled_adb_permissions(_adb_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,7 +167,10 @@ mod tests {
 
     #[test]
     fn workspace_root_contains_bundled_adb_directory() {
-        assert_eq!(workspace_adb_dir(), workspace_root().join("adb").join(adb_platform_dir()));
+        assert_eq!(
+            workspace_adb_dir(),
+            workspace_root().join("adb").join(adb_platform_dir())
+        );
     }
 
     #[test]
